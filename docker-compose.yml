@@ -1,0 +1,49 @@
+version: "3.9"
+
+services:
+  node-a:
+    build: .
+    environment:
+      - NODE_ID=node-a
+      - REST_ADDR=:8080
+      - GRPC_ADDR=:9090
+      # node-a is the seed — no SEED_ADDR, it starts as leader
+    ports:
+      - "8080:8080"   # REST
+      - "9090:9090"   # gRPC
+    networks:
+      - sentinel
+
+  node-b:
+    build: .
+    environment:
+      - NODE_ID=node-b
+      - REST_ADDR=:8080
+      - GRPC_ADDR=:9090
+      - SEED_ADDR=node-a:9090  # joins cluster via node-a
+    ports:
+      - "8081:8080"
+      - "9091:9090"
+    depends_on:
+      - node-a
+    networks:
+      - sentinel
+
+  node-c:
+    build: .
+    environment:
+      - NODE_ID=node-c
+      - REST_ADDR=:8080
+      - GRPC_ADDR=:9090
+      - SEED_ADDR=node-a:9090
+    ports:
+      - "8082:8080"
+      - "9092:9090"
+    depends_on:
+      - node-a
+    networks:
+      - sentinel
+
+networks:
+  sentinel:
+    driver: bridge

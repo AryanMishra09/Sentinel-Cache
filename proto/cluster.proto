@@ -1,0 +1,122 @@
+syntax = "proto3";
+
+package cluster;
+
+option go_package = "github.com/aryan-mishra/sentinel-cache/proto/gen";
+
+// ClusterService handles all node-to-node communication.
+// Clients never call this — it's internal cluster traffic only.
+service ClusterService {
+  // Heartbeat is a bidirectional stream: each node pumps health updates to
+  // the leader, and the leader ACKs. One persistent connection per node.
+  rpc Heartbeat(stream HeartbeatRequest) returns (stream HeartbeatResponse);
+
+  // Replicate forwards a write from primary to replica.
+  rpc Replicate(ReplicateRequest) returns (ReplicateResponse);
+
+  // Promote tells a replica to take over as primary for a key range.
+  rpc Promote(PromoteRequest) returns (PromoteResponse);
+
+  // Join registers a new node with the cluster.
+  rpc Join(JoinRequest) returns (JoinResponse);
+
+  // Leave gracefully removes a node from the cluster.
+  rpc Leave(LeaveRequest) returns (LeaveResponse);
+
+  // Election is used during bully leader election.
+  rpc Election(ElectionRequest) returns (ElectionResponse);
+
+  // AnnounceLeader is broadcast by the winner to tell all peers the new leader.
+  rpc AnnounceLeader(AnnounceLeaderRequest) returns (AnnounceLeaderResponse);
+}
+
+// ── Heartbeat ────────────────────────────────────────────────────────────────
+
+message HeartbeatRequest {
+  string node_id   = 1;
+  string status    = 2; // "healthy" | "recovering"
+  int64  timestamp = 3; // unix seconds
+  int64  key_count = 4; // number of keys this node holds
+}
+
+message HeartbeatResponse {
+  bool ack = 1;
+}
+
+// ── Replication ──────────────────────────────────────────────────────────────
+
+message ReplicateRequest {
+  string key         = 1;
+  string value       = 2;
+  int64  ttl_seconds = 3; // 0 = no expiry
+  bool   is_delete   = 4; // true = replicate a deletion
+}
+
+message ReplicateResponse {
+  bool success = 1;
+}
+
+// ── Failover ─────────────────────────────────────────────────────────────────
+
+message PromoteRequest {
+  string node_id = 1; // the node being promoted to primary
+}
+
+message PromoteResponse {
+  bool success = 1;
+}
+
+// ── Membership ───────────────────────────────────────────────────────────────
+
+message JoinRequest {
+  string node_id   = 1;
+  string rest_addr = 2; // e.g. "node-a:8080"
+  string grpc_addr = 3; // e.g. "node-a:9090"
+}
+
+message JoinResponse {
+  repeated NodeInfo peers     = 1; // current cluster members
+  string            leader_id = 2; // who is the current leader
+}
+
+message LeaveRequest {
+  string node_id = 1;
+}
+
+message LeaveResponse {
+  bool success = 1;
+}
+
+// ── Leader Election ──────────────────────────────────────────────────────────
+
+message ElectionRequest {
+  string candidate_id = 1; // the node initiating the election
+  int64  term         = 2; // monotonically increasing election term
+}
+
+message ElectionResponse {
+  bool yield = 1;
+  // true  = "I yield, you can be leader" (my ID is lower than yours)
+  // false = "I'm taking over" (my ID is higher, back off)
+}
+
+// ── Leader Announcement ──────────────────────────────────────────────────────
+
+message AnnounceLeaderRequest {
+  string leader_id     = 1;
+  string dead_leader_id = 2; // the node we replaced (so peers can remove it from ring)
+  int64  term          = 3;
+}
+
+message AnnounceLeaderResponse {
+  bool ack = 1;
+}
+
+// ── Shared ───────────────────────────────────────────────────────────────────
+
+message NodeInfo {
+  string node_id   = 1;
+  string rest_addr = 2;
+  string grpc_addr = 3;
+  string status    = 4; // "healthy" | "dead" | "recovering"
+}
