@@ -1,704 +1,543 @@
 # SentinelCache
 
-## Self-Healing Distributed In-Memory Cache
+**A self-healing distributed in-memory cache built from scratch in Go.**
+
+Consistent hashing, synchronous gRPC replication, heartbeat-based failure detection, automatic failover, and bully-algorithm leader election — all wired together and demonstrable with a single `docker compose up`.
 
 ---
 
-# 1. Overview
+## Features
 
-## One-Line Description
-
-SentinelCache is a self-healing distributed in-memory cache built in Go that automatically replicates data, detects node failures, elects leaders, performs failover, and rebalances data across the cluster without human intervention.
+| Feature | What it does |
+|---|---|
+| **LRU Cache Engine** | O(1) get/set/delete via doubly linked list + hashmap |
+| **TTL Expiration** | Lazy expiry on read + active background cleanup every second |
+| **Consistent Hashing** | 150 virtual nodes per physical node, MD5, binary search O(log N) |
+| **Request Forwarding** | Any node accepts any write — automatically proxied to the ring-assigned primary |
+| **Synchronous Replication** | Write ACKed only after primary + replica both confirm; rolled back on failure |
+| **Heartbeat Detection** | Persistent bidirectional gRPC stream; node marked dead after 5 s silence |
+| **Automatic Failover** | Leader broadcasts ring update to all peers via `Promote` RPC |
+| **Leader Election** | Bully algorithm — highest-available node ID wins; double-election race guarded |
 
 ---
 
-# 2. Problem Statement
+## Quick Start
 
-Modern applications rely heavily on caching systems such as Redis to reduce database load and improve response times.
+**Prerequisites:** Docker, Docker Compose, `curl`. Optional: [`jq`](https://stedolan.github.io/jq/) for pretty JSON output.
 
-A single cache server introduces a critical problem:
-
-```text
-Single Point of Failure
+```bash
+git clone https://github.com/aryan-mishra/sentinel-cache
+cd sentinel-cache
+docker compose up --build
 ```
 
-If the cache node crashes:
-
-* Cached data becomes unavailable
-* Application latency increases
-* Database load spikes
-* Service reliability decreases
-
-Distributed cache systems solve this by:
-
-* Partitioning data across multiple nodes
-* Replicating data for fault tolerance
-* Detecting failures automatically
-* Recovering without human intervention
-
-The goal of SentinelCache is to implement these distributed systems concepts from scratch and understand how systems like Redis Cluster, DynamoDB, Cassandra, and Hazelcast work internally.
+Three nodes start: node-a (leader, port 8080), node-b (8081), node-c (8082). Wait ~3 seconds for all nodes to join, then open a second terminal and follow the walkthrough below.
 
 ---
 
-# 3. Goals
+## Hands-On Walkthrough
 
-The project should demonstrate understanding of:
+Every feature, step by step. Copy-paste the commands — no thinking required.
 
-## Distributed Systems
+### 0. Verify the cluster is healthy
 
-* Data Partitioning
-* Consistent Hashing
-* Replication
-* Failure Detection
-* Leader Election
-* Automatic Failover
-* Dynamic Rebalancing
+```bash
+curl -s localhost:8080/cluster/status | jq .
+```
 
-## Backend Engineering
+Expected output:
+```json
+{
+  "leader_id": "node-a",
+  "node_id":   "node-a",
+  "key_count": 0,
+  "peers": [
+    { "id": "node-b", "status": "healthy" },
+    { "id": "node-c", "status": "healthy" }
+  ]
+}
+```
 
-* Network Communication
-* Concurrent Processing
-* API Design
-* Memory Management
-
-## Infrastructure Engineering
-
-* Multi-node Deployment
-* Cluster Management
-* Self-Healing Systems
+All three nodes are up. node-a is the initial leader (it's the seed node — no `SEED_ADDR` env var set).
 
 ---
 
-# 4. Non-Goals
+### 1. Basic SET / GET / DELETE
 
-The project is not intended to replace Redis in production.
+```bash
+# Write a key
+curl -s -X POST localhost:8080/set \
+  -H 'Content-Type: application/json' \
+  -d '{"key":"user:1","value":"alice"}' | jq .
+```
+```json
+{
+  "ok":         true,
+  "written_by": "node-a",
+  "primary":    "node-a",
+  "replica":    "node-c"
+}
+```
 
-The following features are intentionally excluded.
+> The response tells you which node owns this key (`primary`) and which holds the replica (`replica`). Different keys route to different nodes based on the consistent hash ring.
 
-## Redis Features
+```bash
+# Read it back
+curl -s localhost:8080/get/user:1 | jq .
+```
+```json
+{ "key": "user:1", "value": "alice", "served_by": "node-a" }
+```
 
-* Pub/Sub
-* Streams
-* Lua Scripts
-* Transactions
-* Sorted Sets
-* HyperLogLog
-* Bloom Filters
-* ACLs
+```bash
+# Delete it
+curl -s -X DELETE localhost:8080/delete/user:1 | jq .
 
-## Infrastructure
-
-* Kubernetes
-* Service Mesh
-* Multi-region Replication
-
-## Persistence
-
-* Disk Persistence
-* AOF
-* RDB Snapshots
-
-## Advanced Distributed Systems
-
-* Gossip Protocol
-* Quorum Reads/Writes
-* Raft Consensus
-* Paxos Consensus
-
-These may be added in future versions.
+# Confirm it's gone (returns 404)
+curl -s localhost:8080/get/user:1 | jq .
+```
+```json
+{ "error": "key not found", "served_by": "node-a" }
+```
 
 ---
 
-# 5. Technology Stack
+### 2. TTL Expiration
 
-## Language
+```bash
+# Write a key that expires in 5 seconds
+curl -s -X POST localhost:8080/set \
+  -H 'Content-Type: application/json' \
+  -d '{"key":"session:tmp","value":"expires-soon","ttl":5}' | jq .
 
-```text
-Go
+# Key is there immediately
+curl -s localhost:8080/get/session:tmp | jq .
+# → {"key":"session:tmp","value":"expires-soon","served_by":"node-a"}
+
+# Wait 6 seconds
+sleep 6
+
+# Key is gone — expired
+curl -s localhost:8080/get/session:tmp | jq .
+# → {"error":"key not found","served_by":"node-a"}
 ```
 
-Reason:
-
-* Excellent concurrency support
-* Industry standard for infrastructure software
-* Strong performance
-* Simple deployment model
+> Two expiry mechanisms are running simultaneously: **lazy expiry** (checked on every `GET`) and **active cleanup** (a background goroutine that scans every second). Even keys no one reads get cleaned up.
 
 ---
 
-## Communication Model
+### 3. Consistent Hashing — See Key Distribution
 
-SentinelCache uses a two-protocol design:
+Write several keys and watch them route to different nodes based on the hash ring:
 
-### Client API
-
-```text
-REST (HTTP/JSON)
+```bash
+for key in user:1 user:2 user:3 order:100 order:200 session:abc; do
+  echo -n "$key → "
+  curl -s -X POST localhost:8080/set \
+    -H 'Content-Type: application/json' \
+    -d "{\"key\":\"$key\",\"value\":\"test\"}" \
+    | jq -r '"primary=\(.primary)  replica=\(.replica)"'
+done
 ```
 
-Used by application clients to read and write cache data.
-
-```http
-POST /set
-GET  /get
-DELETE /delete
+Example output (yours will vary — ring positions are deterministic by MD5 hash):
+```
+user:1   → primary=node-a  replica=node-c
+user:2   → primary=node-c  replica=node-b
+user:3   → primary=node-b  replica=node-a
+order:100 → primary=node-c  replica=node-a
+order:200 → primary=node-a  replica=node-b
+session:abc → primary=node-b  replica=node-c
 ```
 
-### Cluster-Internal Communication
+> Each node owns roughly 1/3 of the key space. The ring uses **150 virtual nodes per physical node** — without virtual nodes, a 3-node ring would distribute keys very unevenly.
 
-```text
-gRPC (Protocol Buffers)
+---
+
+### 4. Request Forwarding — Write to Any Node
+
+Pick a key whose `primary` is not node-b (check from step 3). Write it to node-b anyway:
+
+```bash
+# user:1 is owned by node-a. POST to node-b (port 8081) — it will forward to node-a.
+curl -s -X POST localhost:8081/set \
+  -H 'Content-Type: application/json' \
+  -d '{"key":"user:1","value":"forwarded-write"}' | jq .
+```
+```json
+{
+  "ok":         true,
+  "written_by": "node-a",
+  "primary":    "node-a",
+  "replica":    "node-c"
+}
 ```
 
-Used for all node-to-node communication: heartbeats, replication, failover, and membership sync.
+> `written_by` is `node-a` even though the request hit node-b on port 8081. node-b checked the ring, saw it didn't own `user:1`, and transparently proxied the request to node-a. The client never needs to know which node owns which key.
+
+---
+
+### 5. Synchronous Replication — Read Your Write from the Replica
+
+Write a key and then read it directly from the replica node:
+
+```bash
+# Write user:1 — response says primary=node-a, replica=node-c
+curl -s -X POST localhost:8080/set \
+  -H 'Content-Type: application/json' \
+  -d '{"key":"user:1","value":"replicated-value"}' | jq .
+
+# Read from the REPLICA (node-c, port 8082) — data is already there
+curl -s localhost:8082/get/user:1 | jq .
+```
+```json
+{ "key": "user:1", "value": "replicated-value", "served_by": "node-c" }
+```
+
+> The write was **not** acknowledged until node-c confirmed it received the data via the `gRPC Replicate` RPC. If replication had failed, node-a would have rolled back the local write and returned HTTP 502 to the client.
+
+---
+
+### 6. Failure Detection + Failover — Kill a Follower Node
+
+With the cluster running, stop node-b:
+
+```bash
+docker compose stop node-b
+```
+
+Watch node-a's logs (in your first terminal or a new one):
+```bash
+docker compose logs -f node-a
+```
+
+After ~5 seconds you'll see:
+```
+[node-a] *** FAILOVER: node-b is dead ***
+[node-a] failover: broadcasting death of node-b to all peers
+```
+
+Verify node-b is marked dead:
+```bash
+curl -s localhost:8080/cluster/status | jq .peers
+```
+```json
+[
+  { "id": "node-b", "status": "dead" },
+  { "id": "node-c", "status": "healthy" }
+]
+```
+
+Keys that were on node-b still work — they now route to the next node clockwise on the ring:
+```bash
+# Any key previously owned by node-b now routes to node-a or node-c automatically
+curl -s localhost:8080/get/user:3 | jq .
+# → served_by has changed to the next ring node — node-b's replica
+```
+
+Bring node-b back up:
+```bash
+docker compose start node-b
+```
+
+---
+
+### 7. Leader Election — Kill the Leader
+
+This is the most interesting scenario. Kill node-a, which is the current leader:
+
+```bash
+docker compose stop node-a
+```
+
+Watch the election unfold in node-c's logs:
+```bash
+docker compose logs -f node-c
+```
+
+```
+[node-c] heartbeat stream lost — failure 1/3
+[node-c] heartbeat stream lost — failure 2/3
+[node-c] heartbeat stream lost — failure 3/3
+[node-c] leader appears dead — triggering election
+[node-c] starting bully election (term=1, dead=node-a)
+[node-c] no higher peers — winning election immediately
+[node-c] *** WON ELECTION (term=1) — new leader ***
+[node-c] removed dead leader node-a from ring
+[node-c] *** LEADER — failure detector started ***
+[node-c] ♥ heartbeat from node-b
+```
+
+After ~8 seconds, verify node-c is the new leader:
+```bash
+curl -s localhost:8081/cluster/status | jq '{leader_id,node_id}'
+```
+```json
+{ "leader_id": "node-c", "node_id": "node-b" }
+```
+
+```bash
+curl -s localhost:8082/cluster/status | jq '{leader_id,node_id}'
+```
+```json
+{ "leader_id": "node-c", "node_id": "node-c" }
+```
+
+Data written before node-a died is still accessible (it was replicated to node-c before the failure):
+```bash
+curl -s localhost:8081/get/user:1 | jq .
+# → {"key":"user:1","value":"replicated-value","served_by":"node-c"}
+```
+
+Bring node-a back up (it rejoins as a follower — node-c stays leader):
+```bash
+docker compose start node-a
+```
+
+---
+
+### 8. LRU Eviction — Memory Limits
+
+The cache is capped at **100 MB**. When the limit is reached, the least recently used key is evicted. Test this by running the local binary with a tiny limit:
+
+```bash
+make build
+
+# Start a single node with a 30-byte memory cap
+NODE_ID=test REST_ADDR=:9000 GRPC_ADDR=:9999 go run ./cmd/node &
+
+# Fill it up
+curl -s -X POST localhost:9000/set -H 'Content-Type: application/json' \
+  -d '{"key":"a","value":"1234567890"}' # 11 bytes
+curl -s -X POST localhost:9000/set -H 'Content-Type: application/json' \
+  -d '{"key":"b","value":"1234567890"}' # 11 bytes — total 22 bytes
+
+# Access 'a' to mark it recently used
+curl -s localhost:9000/get/a
+
+# Add 'c' — this must evict 'b' (least recently used, not 'a')
+curl -s -X POST localhost:9000/set -H 'Content-Type: application/json' \
+  -d '{"key":"c","value":"123456789012"}' # 13 bytes — pushes over 30
+
+curl -s localhost:9000/get/b  # → 404 (evicted)
+curl -s localhost:9000/get/a  # → 200 (survived — was recently accessed)
+```
+
+---
+
+## Architecture
+
+```
+                    Leader (e.g. node-a)
+                         │  failure detection
+     ┌───────────────────┼───────────────────┐
+     │   ♥ heartbeats    │                   │
+     ▼                   ▼                   ▼
+
+   Node A             Node B             Node C
+
+ primary for        primary for        primary for
+ ~1/3 of keys      ~1/3 of keys      ~1/3 of keys
+ replica for        replica for        replica for
+ another ~1/3      another ~1/3      another ~1/3
+
+     └──────────── gRPC Replication ──────────┘
+```
+
+**Two independent roles — do not confuse them:**
+
+- **Leader** — one node cluster-wide. Runs the failure detector, coordinates failover. Elected via bully algorithm. Any node can become leader.
+- **Primary / Replica** — per-key roles assigned by the consistent hash ring. Each node is simultaneously primary for some keys and replica for others.
+
+**Communication split:**
+
+| Traffic | Protocol | Why |
+|---|---|---|
+| Client ↔ Node | REST (Gin) | Human-readable, easy to `curl` |
+| Node ↔ Node | gRPC (protobuf) | Typed contracts, bidirectional streaming, what etcd/CockroachDB use |
+
+---
+
+## How the Algorithms Work
+
+### Consistent Hashing
+
+The hash ring has `150 × N` virtual nodes (N = number of physical nodes). Each virtual node is `MD5(nodeID + strconv(i))`, sorted on a uint32 ring. A `GET` does binary search in O(log N) to find the first virtual node clockwise from `MD5(key)`. `GetReplica(key, 2)` walks clockwise past the first virtual node to find a *distinct* physical node — that becomes the replica.
+
+150 virtual nodes keeps load variance below ~10% even with 3 nodes. With 1 virtual node per physical node you'd see 3× variance.
+
+### LRU Cache
+
+`container/list` (doubly linked list) + `map[string]*list.Element`. Every `Set` pushes to the front; every `Get` calls `MoveToFront`. Eviction pops from the back. Both are O(1). A `sync.Mutex` (not `RWMutex`) guards the whole thing — `Get` mutates LRU order so there's no such thing as a "read-only" operation.
+
+### Heartbeat & Failure Detection
+
+Each follower maintains a **persistent bidirectional gRPC stream** to the leader. The sender ticks every second. The detector on the leader records `lastSeen[nodeID] = time.Now()` on each tick. A background goroutine checks every second — if `now - lastSeen[id] > 5s`, `onDead(id)` fires outside the lock (to prevent deadlock). After 3 consecutive stream failures the sender fires `onLeaderDead`, triggering election.
+
+### Bully Election
+
+When a follower detects the leader is dead:
+1. It sends `Election` RPC to every peer with a higher node ID concurrently.
+2. Each peer: if the candidate's ID is higher → `yield=true`. If own ID is higher → `yield=false`, start own election.
+3. If all higher peers yield (or are unreachable) → win. Call `AnnounceLeader` to all peers.
+4. All peers update their ring (`Remove(deadLeader)`) and set the new leader.
+
+Race guard: if a node is already leader when it receives an `Election` RPC, it refuses without starting a new election. Without this, a node that just won could receive a delayed election message, start a second election with itself as the "dead leader", and accidentally remove itself from its own ring.
+
+---
+
+## gRPC Contract
+
+All node-to-node communication is defined in `proto/cluster.proto`:
 
 ```protobuf
 service ClusterService {
   rpc Heartbeat(stream HeartbeatRequest) returns (stream HeartbeatResponse);
-  rpc Replicate(ReplicateRequest)        returns (ReplicateResponse);
-  rpc Promote(PromoteRequest)            returns (PromoteResponse);
-  rpc Join(JoinRequest)                  returns (JoinResponse);
-  rpc Leave(LeaveRequest)                returns (LeaveResponse);
-  rpc Election(ElectionRequest)          returns (ElectionResponse);
+  rpc Replicate(ReplicateRequest)           returns (ReplicateResponse);
+  rpc Promote(PromoteRequest)               returns (PromoteResponse);
+  rpc Join(JoinRequest)                     returns (JoinResponse);
+  rpc Leave(LeaveRequest)                   returns (LeaveResponse);
+  rpc Election(ElectionRequest)             returns (ElectionResponse);
   rpc AnnounceLeader(AnnounceLeaderRequest) returns (AnnounceLeaderResponse);
 }
 ```
 
-Reason:
-
-* Typed contracts make inter-node protocol explicit and auditable
-* Bidirectional streaming suits continuous heartbeat flows
-* Built-in deadlines, retries, and connection management
-* Used by real distributed systems: etcd, CockroachDB, Kubernetes
-
----
-
-## Deployment
-
-```text
-Docker
-Docker Compose
-```
-
-Each container represents one cache node.
-
----
-
-## Storage
-
-```go
-map[string]CacheEntry
-```
-
-The cache is fully in-memory. No database is used.
-
----
-
-# 6. High-Level Architecture
-
-```text
-                     Leader Node (e.g. node-a)
-                          │  failure detection
-      ┌───────────────────┼───────────────────┐
-      │   heartbeats      │                   │
-      ▼                   ▼                   ▼
-
-    Node A             Node B             Node C
-  primary for        primary for        primary for
-  ~1/3 of keys      ~1/3 of keys      ~1/3 of keys
-  replica for        replica for        replica for
-  ~1/3 of keys      ~1/3 of keys      ~1/3 of keys
-
-      └───────────────────┼───────────────────┘
-                          │
-               gRPC Heartbeats / Replication
-```
-
-**Two independent roles — do not confuse them:**
-- **Leader** — one node cluster-wide, responsible for failure detection and failover coordination. Elected via bully algorithm. Any node can become leader.
-- **Primary/Replica** — per-key roles assigned by the consistent hash ring. Each node is primary for some keys and replica for others simultaneously.
-
-Every node:
-
-* Stores cache data for its assigned key ranges
-* Accepts writes for any key and forwards to the correct primary
-* Sends heartbeats to the leader over a persistent gRPC stream
-* Can become leader if the current leader fails
-
----
-
-# 7. Core Features
-
----
-
-## Feature 1: Cache Engine
-
-### Client API (REST)
-
-```http
-POST   /set
-GET    /get
-DELETE /delete
-```
-
-### Example
-
-```text
-SET user:1 Aryan
-GET user:1
-DELETE user:1
-```
-
-### Responsibilities
-
-* Store keys
-* Retrieve keys
-* Delete keys
-
----
-
-## Feature 2: TTL Expiration
-
-### Example
-
-```text
-SET user:1 Aryan EX 60
-```
-
-After 60 seconds:
-
-```text
-GET user:1
-nil
-```
-
-### Responsibilities
-
-* Store expiration metadata
-* Run background cleanup workers
-* Automatically remove expired entries
-
----
-
-## Feature 3: LRU Eviction
-
-When memory usage exceeds the configured limit:
-
-```text
-100 MB
-```
-
-The least recently used keys are evicted.
-
-### Responsibilities
-
-* Track access order using a doubly linked list + hashmap (O(1) get and evict)
-* Automatically evict stale entries when the limit is reached
-
----
-
-# 8. Distributed Cluster
-
----
-
-## Feature 4: Cluster Membership
-
-Nodes can:
-
-```text
-Join Cluster
-Leave Cluster
-Crash
-Recover
-```
-
-### gRPC RPCs
-
-```protobuf
-rpc Join(JoinRequest)   returns (JoinResponse);
-rpc Leave(LeaveRequest) returns (LeaveResponse);
-```
-
-### Responsibilities
-
-* Track active nodes
-* Maintain cluster topology
-* Synchronize membership information
-
----
-
-## Feature 5: Consistent Hashing
-
-Keys are distributed using a consistent hash ring with virtual nodes.
-
-### Example
-
-```text
-user:1 → Node A
-user:2 → Node C
-user:3 → Node B
-```
-
-### Benefits
-
-* Even key distribution
-* Minimal data movement when nodes join or leave
-* Efficient node scaling
-
-### Responsibilities
-
-* Build hash ring with virtual nodes
-* Assign ownership
-* Recompute ownership on topology changes
-
----
-
-## Feature 6: Replication
-
-Every key is replicated synchronously to one replica before the write is acknowledged.
-
-### Consistency Model
-
-```text
-Synchronous replication to 1 replica.
-Write is ACKed only after primary and replica both confirm.
-If replication fails, the local write is rolled back and the client receives an error.
-```
-
-### Example
-
-```text
-Primary: Node A
-Replica: Node B
-```
-
-When:
-
-```text
-POST /set {"key":"user:1","value":"Aryan"}
-```
-
-1. Client may hit any node — it is automatically forwarded to the primary (Node A).
-2. Node A writes locally.
-3. Node A replicates to Node B via `gRPC Replicate`.
-4. Only after Node B confirms does Node A ACK the client.
-5. If replication fails, Node A rolls back and returns HTTP 502.
-
-### gRPC RPC
-
-```protobuf
-rpc Replicate(ReplicateRequest) returns (ReplicateResponse);
-```
-
-### Responsibilities
-
-* Replicate writes synchronously
-* Maintain replicas
-* Recover from primary failures
-
----
-
-# 9. Self-Healing Features
-
----
-
-## Feature 7: Heartbeats
-
-Every node sends periodic heartbeat messages to the leader over a persistent gRPC stream.
-
-### Heartbeat Message
-
-```protobuf
-message HeartbeatRequest {
-  string node_id  = 1;
-  string status   = 2;
-  int64  timestamp = 3;
-}
-```
-
-### gRPC RPC
-
-```protobuf
-rpc Heartbeat(stream HeartbeatRequest) returns (stream HeartbeatResponse);
-```
-
-### Responsibilities
-
-* Report node health continuously
-* Detect communication failures
-
----
-
-## Feature 8: Failure Detection
-
-If heartbeats are not received within the configured threshold:
-
-```text
-Node A
-↓
-Heartbeat Timeout (default: 5s)
-↓
-Node Marked Dead
-↓
-Recovery Workflow Triggered
-```
-
-### Responsibilities
-
-* Detect unhealthy nodes
-* Trigger failover
-
----
-
-## Feature 9: Automatic Failover
-
-When a primary node fails:
-
-```text
-Node A (Primary) — fails
-↓
-Leader detects missed heartbeats
-↓
-Leader promotes Node B (Replica) via gRPC Promote RPC
-↓
-Hash ring updated
-↓
-Cluster resumes serving requests
-```
-
-### gRPC RPC
-
-```protobuf
-rpc Promote(PromoteRequest) returns (PromoteResponse);
-```
-
-### Responsibilities
-
-* Promote replicas
-* Update routing
-* Maintain availability
-
----
-
-## Feature 10: Dynamic Rebalancing
-
-When a new node joins, the hash ring is recomputed and ownership is updated.
-
-### Scope
-
-New writes are immediately routed to the correct node per the updated ring. Existing keys are lazily migrated — they remain on the old node until TTL expiry or explicit eviction. This avoids migration complexity while keeping the ring correct for new traffic.
-
-### Example
-
-Before:
-
-```text
-Node A = 40%
-Node B = 30%
-Node C = 30%
-```
-
-After Node D joins:
-
-```text
-Node A = 25%
-Node B = 25%
-Node C = 25%
-Node D = 25%
-```
-
-### Responsibilities
-
-* Recompute hash ring on topology change
-* Route new writes to correct owner
-* Lazy migration of existing keys
-
----
-
-# 10. Cluster Coordination
-
----
-
-## Feature 11: Leader Election
-
-One node acts as the cluster leader using a **bully election algorithm**.
-
-### Algorithm
-
-```text
-1. Any node that detects a leader failure initiates an election.
-2. It sends an ELECTION message to all nodes with a higher ID.
-3. If no higher-ID node responds within a timeout, it declares itself leader.
-4. If a higher-ID node responds, it takes over the election.
-5. The winner broadcasts LEADER to all nodes.
-```
-
-This guarantees the highest-available node ID always becomes leader under normal network conditions — only one node can receive all-yields, so exactly one winner emerges per election.
-
-**Known limitation:** under a network partition, two isolated groups could each elect their own leader (split-brain). This is an inherent weakness of the bully algorithm. Production systems use Raft or Paxos for partition safety; this project implements bully to demonstrate the core concept.
-
-### Leader Responsibilities
-
-* Manage cluster membership
-* Handle failover decisions
-* Coordinate rebalancing
-* Maintain cluster state
-
-### Example
-
-```text
-Leader Failure
-↓
-Election Initiated (Bully Algorithm)
-↓
-Highest Available Node Wins
-↓
-New Leader Broadcasts LEADER Message
-↓
-Cluster Resumes
+Regenerate Go code after editing the proto:
+```bash
+make proto
 ```
 
 ---
 
-# 11. Deployment Model
+## Development
 
-## Local Cluster
+### Prerequisites
 
-```text
-Docker Compose
+- Go 1.21+
+- Docker + Docker Compose
+- `protoc` + `protoc-gen-go` + `protoc-gen-go-grpc` (only needed if editing `.proto`)
 
-├── node-a (port 8080 REST, 9090 gRPC)  ← seed / initial leader
-├── node-b (port 8081 REST, 9091 gRPC)
-└── node-c (port 8082 REST, 9092 gRPC)
-```
-
-Every container runs one SentinelCache node. Docker simulates distributed machines on a single host.
-
-Cluster status is visible on any node via:
+### Run locally (no Docker)
 
 ```bash
-curl localhost:8080/cluster/status
+# Terminal 1 — seed node (becomes leader)
+NODE_ID=node-a REST_ADDR=:8080 GRPC_ADDR=:9090 go run ./cmd/node
+
+# Terminal 2
+NODE_ID=node-b REST_ADDR=:8081 GRPC_ADDR=:9091 SEED_ADDR=:9090 go run ./cmd/node
+
+# Terminal 3
+NODE_ID=node-c REST_ADDR=:8082 GRPC_ADDR=:9092 SEED_ADDR=:9090 go run ./cmd/node
+```
+
+> **Note:** use `go build -o bin/node ./cmd/node && ./bin/node` instead of `go run` if you want `kill $PID` to work correctly. `go run` wraps the binary in a subprocess — `kill` hits the wrapper, not the node.
+
+### Run tests
+
+```bash
+go test ./...
+```
+
+Tests cover:
+- `internal/cache` — LRU eviction, TTL expiry, overwrite, delete (5 tests)
+- `internal/cluster` — Ring distribution, node join/leave, replica routing (5 tests)
+- `internal/election` — No-higher-peers win, dead peers ignored, concurrent election guard, term increment, dead leader ID propagation (5 tests)
+- `internal/replication` — Real in-process gRPC servers: write propagation, delete propagation, non-primary no-op (3 tests)
+
+### Project structure
+
+```
+sentinel-cache/
+├── cmd/node/main.go              ← binary entry point, wires everything together
+├── internal/
+│   ├── cache/
+│   │   ├── engine.go             ← LRU cache (SET/GET/DELETE + eviction)
+│   │   ├── ttl.go                ← background TTL cleanup goroutine
+│   │   └── engine_test.go
+│   ├── cluster/
+│   │   ├── node.go               ← node identity, peer tracking, leader state
+│   │   ├── ring.go               ← consistent hash ring (150 vnodes, MD5)
+│   │   ├── membership.go         ← JoinCluster() — dials seed, bootstraps ring
+│   │   └── ring_test.go
+│   ├── api/
+│   │   └── handler.go            ← Gin REST handlers (set/get/delete/status + forwarding)
+│   ├── grpc/
+│   │   └── server.go             ← gRPC server implementing all ClusterService RPCs
+│   ├── heartbeat/
+│   │   ├── sender.go             ← follower side: persistent stream to leader
+│   │   └── detector.go           ← leader side: lastSeen tracking, onDead callback
+│   ├── replication/
+│   │   └── replicator.go         ← primary → replica write forwarding via gRPC
+│   ├── failover/
+│   │   └── failover.go           ← BroadcastNodeDeath: ring update + Promote RPC fan-out
+│   └── election/
+│       ├── bully.go              ← bully algorithm: Start(), higherPeers(), becomeLeader()
+│       └── bully_test.go
+├── proto/
+│   └── cluster.proto             ← gRPC service + message definitions
+├── proto/gen/                    ← generated Go code (gitignored — run `make proto`)
+├── Makefile
+├── Dockerfile                    ← multi-stage: builder → alpine final image
+├── docker-compose.yml            ← 3-node local cluster
+└── DEVLOG.md                     ← build journal: every file, decision, and concept explained
 ```
 
 ---
 
-# 12. Demonstration Scenario
+## Non-Goals
 
-## Scenario 1 — Normal Write (any node, transparent forwarding)
+This is a learning project — not a production Redis replacement.
 
-```bash
-# Hit node-b even though node-a owns this key — it gets forwarded automatically
-curl -X POST localhost:8081/set \
-  -H 'Content-Type: application/json' \
-  -d '{"key":"user:1","value":"Aryan","ttl":300}'
-```
-
-Flow:
-
-```text
-Client → POST /set to node-b
-↓
-node-b checks ring: primary for "user:1" is node-a
-↓
-node-b forwards request to node-a (HTTP proxy)
-↓
-node-a writes locally, replicates to node-c via gRPC Replicate
-↓
-Only after node-c confirms: node-a ACKs node-b, node-b ACKs client
-```
-
-```bash
-# Read from any node — replica serves it directly
-curl localhost:8082/get/user:1
-# → {"key":"user:1","value":"Aryan","served_by":"node-c"}
-```
+Intentionally excluded:
+- Persistence (AOF, RDB snapshots, WAL)
+- TLS / mTLS
+- Kubernetes / service mesh
+- Quorum reads/writes
+- Gossip protocol (uses leader-centric heartbeats instead)
+- Raft/Paxos (uses bully algorithm — simpler, demonstrable, known tradeoffs)
 
 ---
 
-## Scenario 2 — Leader Failure (election + ring update)
+## Future Enhancements
 
-```bash
-docker stop node-a   # node-a is the initial leader
-```
+**v2**
+- Monitoring dashboard (live node health, key distribution, failover events)
+- Connection pooling in the replicator (currently dials per write)
+- Prometheus metrics endpoint
+- gRPC connection pool
 
-What actually happens in the code:
-
-```text
-Heartbeat streams from node-b and node-c to node-a break
-↓
-After 3 consecutive stream failures (~6s): onLeaderDead() fires
-↓
-Bully election starts — node-c contacts node-b (higher ID wins)
-↓
-node-c wins, broadcasts AnnounceLeader to all peers
-↓
-All nodes call ring.Remove("node-a") — node-a's key range reroutes
-↓
-node-c starts failure detector, becomes new leader
-↓
-Cluster healthy — total recovery ~8 seconds, no manual intervention
-```
-
-```bash
-# Verify new leader
-curl localhost:8082/cluster/status
-# → {"leader_id":"node-c", "peers":[{"id":"node-a","status":"dead"},{"id":"node-b","status":"healthy"}]}
-
-# Data written before the failure is still served by the replica
-curl localhost:8082/get/user:1
-# → {"key":"user:1","value":"Aryan","served_by":"node-c"}
-```
+**v3**
+- Raft consensus (replace bully — partition-safe)
+- Quorum reads/writes
+- Persistence (WAL)
 
 ---
 
-## Scenario 3 — Non-Leader Node Failure (detect + promote)
+## Known Limitations
 
-```bash
-docker stop node-b   # node-b is a follower
-```
-
-```text
-node-c (leader) failure detector: no heartbeat from node-b for 5s
-↓
-onDead callback fires: BroadcastNodeDeath("node-b")
-↓
-Leader calls ring.Remove("node-b") on all nodes via Promote RPC
-↓
-node-b's key range reroutes to its replica automatically
-↓
-Cluster healthy
-```
+| Limitation | Detail |
+|---|---|
+| No TLS | All traffic is plaintext. Fine inside a Docker network; not for internet exposure. |
+| Connection-per-write | The replicator opens a new TCP connection for each replicated write. Should be a persistent pool in production. |
+| Bully split-brain | Under a network partition, two isolated groups can each elect a leader. Raft/Paxos required for partition safety. |
+| Lazy ring cleanup | When a node dies, existing cached data on that node is lost. Surviving replicas serve the data; no active migration. |
+| Single replica | Each key has exactly one replica. Losing both primary and replica simultaneously loses that key range. |
 
 ---
 
-# 13. Future Enhancements
-
-## Version 2
-
-* Monitoring Dashboard (node health, leader, key distribution, failover events)
-* Gossip Protocol (replace leader-centric heartbeats)
-* Prometheus Metrics
-* OpenTelemetry Tracing
-
-## Version 3
-
-* Quorum Reads/Writes
-* Persistence (WAL or RDB snapshots)
-* Raft Consensus (replace bully election)
-
----
-
-# 14. Resume Summary
+## Resume Summary
 
 Built a self-healing distributed in-memory cache in Go supporting:
 
-* Consistent Hashing with virtual nodes (150 vnodes, MD5, binary search)
-* Transparent Request Forwarding — any node accepts writes, automatically proxied to the ring-assigned primary
-* Synchronous Replication (primary + 1 replica, write rolled back on failure)
-* gRPC-based bidirectional Heartbeat failure detection (5 s timeout)
-* Automatic Failover via replica promotion and ring rebalancing
-* Bully Algorithm Leader Election (highest-ID wins, term-guarded, double-election race fixed)
-* TTL Expiration with lazy + background active cleanup
-* LRU Eviction (O(1) doubly linked list + hashmap)
+- Consistent Hashing with virtual nodes (150 vnodes, MD5, binary search)
+- Transparent Request Forwarding — any node accepts writes, automatically proxied to the ring-assigned primary
+- Synchronous Replication (primary + 1 replica, write rolled back on failure)
+- gRPC-based bidirectional Heartbeat failure detection (5 s timeout)
+- Automatic Failover via replica promotion and ring rebalancing
+- Bully Algorithm Leader Election (highest-ID wins, term-guarded, double-election race fixed)
+- TTL Expiration with lazy + active background cleanup
+- LRU Eviction (O(1) doubly linked list + hashmap)
 
-Deployed as a 3-node cluster using Docker Compose. Entire self-healing sequence observable via `docker stop`.
+Deployed as a 3-node cluster using Docker Compose. Full self-healing sequence observable via `docker compose stop node-a`.
+
+See [`DEVLOG.md`](./DEVLOG.md) for the complete build journal — every file, design decision, and concept explained in the order it was built.
