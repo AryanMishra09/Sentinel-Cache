@@ -773,20 +773,3 @@ with configurable replication factors.
 | Single replica | Each key has exactly one replica. Losing both primary and replica simultaneously loses that key range. |
 
 ---
-
-## Resume Summary
-
-Built a self-healing distributed in-memory cache in Go supporting:
-
-- Consistent Hashing with virtual nodes (150 vnodes, MD5, binary search)
-- Transparent Request Forwarding — any node accepts any read or write, automatically proxied to the ring-assigned primary
-- Synchronous Replication (primary + 1 replica, write rolled back on failure)
-- gRPC-based bidirectional Heartbeat failure detection (5 s timeout)
-- Automatic Failover via replica promotion and ring rebalancing
-- Bully Algorithm Leader Election (highest-ID wins, term-guarded, double-election race fixed)
-- TTL Expiration with lazy + active background cleanup
-- LRU Eviction (O(1) doubly linked list + hashmap)
-
-Deployed as a 3-node cluster using Docker Compose. Full self-healing sequence observable via `docker compose stop node-a`.
-
-See [`DEVLOG.md`](./DEVLOG.md) for the complete build journal — every file, design decision, and concept explained in the order it was built.
