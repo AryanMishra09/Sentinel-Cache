@@ -7,7 +7,12 @@ services:
       - NODE_ID=node-a
       - REST_ADDR=:8080
       - GRPC_ADDR=:9090
-      # node-a is the seed — no SEED_ADDR, it starts as leader
+      # Advertise addresses: what other containers use to reach this one.
+      # Docker Compose DNS resolves service names (node-a, node-b, node-c)
+      # to the correct container IP inside the sentinel network.
+      - ADVERTISE_REST_ADDR=node-a:8080
+      - ADVERTISE_GRPC_ADDR=node-a:9090
+      # node-a is the seed — no SEED_ADDR, starts as leader
     ports:
       - "8080:8080"   # REST
       - "9090:9090"   # gRPC
@@ -20,7 +25,9 @@ services:
       - NODE_ID=node-b
       - REST_ADDR=:8080
       - GRPC_ADDR=:9090
-      - SEED_ADDR=node-a:9090  # joins cluster via node-a
+      - ADVERTISE_REST_ADDR=node-b:8080
+      - ADVERTISE_GRPC_ADDR=node-b:9090
+      - SEED_ADDR=node-a:9090
     ports:
       - "8081:8080"
       - "9091:9090"
@@ -35,6 +42,8 @@ services:
       - NODE_ID=node-c
       - REST_ADDR=:8080
       - GRPC_ADDR=:9090
+      - ADVERTISE_REST_ADDR=node-c:8080
+      - ADVERTISE_GRPC_ADDR=node-c:9090
       - SEED_ADDR=node-a:9090
     ports:
       - "8082:8080"

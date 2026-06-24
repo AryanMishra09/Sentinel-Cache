@@ -2,6 +2,7 @@ package api
 
 import (
 	"bytes"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
@@ -48,17 +49,16 @@ type setRequest struct {
 
 // ── Forwarding ───────────────────────────────────────────────────────────────
 
-// forwardTo proxies the current request to another node's REST address and
-// writes its response back to the client verbatim. Returns false if forwarding
-// fails (caller should return after checking).
-func (h *Handler) forwardTo(c *gin.Context, targetAddr string) bool {
-	url := "http://" + targetAddr + c.Request.URL.Path
+const forwardedHeader = "X-SentinelCache-Forwarded"
 
-	body, err := io.ReadAll(c.Request.Body)
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "could not read request body"})
-		return false
-	}
+// forwardTo proxies the request to another node's REST address using the given
+// body bytes and writes the target's response back to the client verbatim.
+//
+// The body MUST be passed in explicitly: by the time we decide to forward, the
+// handler has already consumed c.Request.Body (via ShouldBindJSON), so it can no
+// longer be re-read. Pass nil for requests with no body (e.g. DELETE).
+func (h *Handler) forwardTo(c *gin.Context, targetAddr string, body []byte) bool {
+	url := "http://" + targetAddr + c.Request.URL.Path
 
 	req, err := http.NewRequest(c.Request.Method, url, bytes.NewReader(body))
 	if err != nil {
@@ -66,13 +66,17 @@ func (h *Handler) forwardTo(c *gin.Context, targetAddr string) bool {
 		return false
 	}
 	req.Header.Set("Content-Type", "application/json")
+	// Mark the request so the receiving node knows not to forward it again.
+	// Prevents infinite forwarding loops when rings are temporarily inconsistent.
+	req.Header.Set(forwardedHeader, "1")
 
 	client := &http.Client{Timeout: 3 * time.Second}
 	resp, err := client.Do(req)
 	if err != nil {
 		c.JSON(http.StatusBadGateway, gin.H{
-			"error":       "failed to forward to primary",
+			"error":        "failed to forward to primary",
 			"forwarded_to": targetAddr,
+			"detail":       err.Error(),
 		})
 		return false
 	}
@@ -86,16 +90,30 @@ func (h *Handler) forwardTo(c *gin.Context, targetAddr string) bool {
 // ── Handlers ─────────────────────────────────────────────────────────────────
 
 func (h *Handler) handleSet(c *gin.Context) {
-	var req setRequest
-	if err := c.ShouldBindJSON(&req); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+	// Read the raw body ONCE. We need the parsed key to decide routing, but we
+	// also need the original bytes to forward — and ShouldBindJSON would drain
+	// the body, leaving nothing to forward. So we read bytes and parse from them.
+	bodyBytes, err := io.ReadAll(c.Request.Body)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "could not read request body"})
 		return
 	}
 
-	// If this node is not the primary for this key, forward to the primary.
-	// This makes writes correct regardless of which node the client hits.
+	var req setRequest
+	if err := json.Unmarshal(bodyBytes, &req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	if req.Key == "" || req.Value == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "key and value are required"})
+		return
+	}
+
+	// If this node is not the primary for this key, forward to the primary —
+	// but only if this request hasn't already been forwarded. The header guard
+	// prevents infinite loops when two nodes have temporarily inconsistent rings.
 	primary := h.ring.GetReplica(req.Key, 1)
-	if primary != h.node.ID {
+	if primary != h.node.ID && c.GetHeader(forwardedHeader) == "" {
 		primaryAddr := h.node.PeerRESTAddr(primary)
 		if primaryAddr == "" {
 			c.JSON(http.StatusServiceUnavailable, gin.H{
@@ -105,7 +123,7 @@ func (h *Handler) handleSet(c *gin.Context) {
 			return
 		}
 		fmt.Printf("[%s] forwarding SET %q → %s (%s)\n", h.node.ID, req.Key, primary, primaryAddr)
-		h.forwardTo(c, primaryAddr)
+		h.forwardTo(c, primaryAddr, bodyBytes)
 		return
 	}
 
@@ -138,19 +156,34 @@ func (h *Handler) handleSet(c *gin.Context) {
 
 func (h *Handler) handleGet(c *gin.Context) {
 	key := c.Param("key")
-	val, ok := h.engine.Get(key)
-	if !ok {
-		c.JSON(http.StatusNotFound, gin.H{
-			"error":     "key not found",
+
+	// Serve locally if we have it. This node may be the primary OR the replica
+	// for the key — either way the data is here.
+	if val, ok := h.engine.Get(key); ok {
+		// served_by shows which node answered — after failover this changes from
+		// the dead primary to the promoted replica.
+		c.JSON(http.StatusOK, gin.H{
+			"key":       key,
+			"value":     val,
 			"served_by": h.node.ID,
 		})
 		return
 	}
-	// served_by shows which node answered — after failover this changes from
-	// the dead primary to the promoted replica.
-	c.JSON(http.StatusOK, gin.H{
-		"key":       key,
-		"value":     val,
+
+	// Not here. If this node isn't the primary and the request hasn't already
+	// been forwarded, fetch from the primary so reads work against ANY node.
+	primary := h.ring.GetReplica(key, 1)
+	if primary != h.node.ID && c.GetHeader(forwardedHeader) == "" {
+		primaryAddr := h.node.PeerRESTAddr(primary)
+		if primaryAddr != "" {
+			fmt.Printf("[%s] forwarding GET %q → %s (%s)\n", h.node.ID, key, primary, primaryAddr)
+			h.forwardTo(c, primaryAddr, nil)
+			return
+		}
+	}
+
+	c.JSON(http.StatusNotFound, gin.H{
+		"error":     "key not found",
 		"served_by": h.node.ID,
 	})
 }
@@ -158,9 +191,9 @@ func (h *Handler) handleGet(c *gin.Context) {
 func (h *Handler) handleDelete(c *gin.Context) {
 	key := c.Param("key")
 
-	// Forward to primary if this node doesn't own the key.
+	// Forward to primary if this node doesn't own the key (first hop only).
 	primary := h.ring.GetReplica(key, 1)
-	if primary != h.node.ID {
+	if primary != h.node.ID && c.GetHeader(forwardedHeader) == "" {
 		primaryAddr := h.node.PeerRESTAddr(primary)
 		if primaryAddr == "" {
 			c.JSON(http.StatusServiceUnavailable, gin.H{
@@ -170,7 +203,7 @@ func (h *Handler) handleDelete(c *gin.Context) {
 			return
 		}
 		fmt.Printf("[%s] forwarding DELETE %q → %s (%s)\n", h.node.ID, key, primary, primaryAddr)
-		h.forwardTo(c, primaryAddr)
+		h.forwardTo(c, primaryAddr, nil)
 		return
 	}
 

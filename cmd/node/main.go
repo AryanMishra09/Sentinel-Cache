@@ -20,15 +20,23 @@ import (
 
 func main() {
 	nodeID   := env("NODE_ID",   "node-a")
-	restAddr := env("REST_ADDR", ":8080")
-	grpcAddr := env("GRPC_ADDR", ":9090")
+	restAddr := env("REST_ADDR", ":8080")  // bind address — what this process listens on
+	grpcAddr := env("GRPC_ADDR", ":9090")  // bind address
 	seedAddr := env("SEED_ADDR", "")
 
-	fmt.Printf("[%s] starting  rest=%s  grpc=%s  seed=%q\n", nodeID, restAddr, grpcAddr, seedAddr)
+	// Advertise addresses — what OTHER nodes use to reach this one.
+	// In Docker these must be "service-name:port" (e.g. "node-b:9090").
+	// Locally they default to the bind address (fine for single-machine testing).
+	advREST := env("ADVERTISE_REST_ADDR", restAddr)
+	advGRPC := env("ADVERTISE_GRPC_ADDR", grpcAddr)
+
+	fmt.Printf("[%s] starting  bind-rest=%s  bind-grpc=%s  adv-rest=%s  adv-grpc=%s  seed=%q\n",
+		nodeID, restAddr, grpcAddr, advREST, advGRPC, seedAddr)
 
 	engine := cache.NewEngine(100 * 1024 * 1024)
-	node   := cluster.NewNode(nodeID, restAddr, grpcAddr)
-	ring   := cluster.NewRing(0)
+	// Node stores the ADVERTISE addresses — these are what peers dial.
+	node := cluster.NewNode(nodeID, advREST, advGRPC)
+	ring := cluster.NewRing(0)
 	ring.Add(nodeID)
 
 	if seedAddr == "" {

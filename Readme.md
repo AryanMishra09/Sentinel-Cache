@@ -13,7 +13,7 @@ Consistent hashing, synchronous gRPC replication, heartbeat-based failure detect
 | **LRU Cache Engine** | O(1) get/set/delete via doubly linked list + hashmap |
 | **TTL Expiration** | Lazy expiry on read + active background cleanup every second |
 | **Consistent Hashing** | 150 virtual nodes per physical node, MD5, binary search O(log N) |
-| **Request Forwarding** | Any node accepts any write — automatically proxied to the ring-assigned primary |
+| **Request Forwarding** | Any node accepts any read or write — automatically proxied to the ring-assigned primary |
 | **Synchronous Replication** | Write ACKed only after primary + replica both confirm; rolled back on failure |
 | **Heartbeat Detection** | Persistent bidirectional gRPC stream; node marked dead after 5 s silence |
 | **Automatic Failover** | Leader broadcasts ring update to all peers via `Promote` RPC |
@@ -177,24 +177,34 @@ curl -s -X POST localhost:8081/set \
 
 ---
 
-### 5. Synchronous Replication — Read Your Write from the Replica
+### 5. Synchronous Replication + Read From Any Node
 
-Write a key and then read it directly from the replica node:
+Write a key, then read it back from a different node:
 
 ```bash
-# Write user:1 — response says primary=node-a, replica=node-c
+# Write user:1 — note the "replica" field in the response (e.g. node-b)
 curl -s -X POST localhost:8080/set \
   -H 'Content-Type: application/json' \
   -d '{"key":"user:1","value":"replicated-value"}' | jq .
+```
+```json
+{ "ok": true, "written_by": "node-a", "primary": "node-a", "replica": "node-b" }
+```
 
-# Read from the REPLICA (node-c, port 8082) — data is already there
+```bash
+# Read from ANY node — even one that doesn't own the key.
+# If the node doesn't have it, it transparently fetches from the primary.
 curl -s localhost:8082/get/user:1 | jq .
 ```
 ```json
-{ "key": "user:1", "value": "replicated-value", "served_by": "node-c" }
+{ "key": "user:1", "value": "replicated-value", "served_by": "node-a" }
 ```
 
-> The write was **not** acknowledged until node-c confirmed it received the data via the `gRPC Replicate` RPC. If replication had failed, node-a would have rolled back the local write and returned HTTP 502 to the client.
+> Two things happened here:
+> 1. **Synchronous replication** — the write was not acknowledged until the replica (node-b above) confirmed it received the data via the `gRPC Replicate` RPC. If replication had failed, node-a would have rolled back the local write and returned HTTP 502.
+> 2. **Read forwarding** — you read from node-c (8082), which is neither the primary nor the replica for this key. node-c didn't have it locally, so it forwarded the GET to the primary. `served_by` shows which node actually answered.
+>
+> You can also read directly from the replica node (the `replica` value from the write response) — it has the data locally, so `served_by` will be that replica.
 
 ---
 
@@ -530,7 +540,7 @@ Intentionally excluded:
 Built a self-healing distributed in-memory cache in Go supporting:
 
 - Consistent Hashing with virtual nodes (150 vnodes, MD5, binary search)
-- Transparent Request Forwarding — any node accepts writes, automatically proxied to the ring-assigned primary
+- Transparent Request Forwarding — any node accepts any read or write, automatically proxied to the ring-assigned primary
 - Synchronous Replication (primary + 1 replica, write rolled back on failure)
 - gRPC-based bidirectional Heartbeat failure detection (5 s timeout)
 - Automatic Failover via replica promotion and ring rebalancing
