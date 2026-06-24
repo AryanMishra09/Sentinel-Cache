@@ -21,6 +21,130 @@ Consistent hashing, synchronous gRPC replication, heartbeat-based failure detect
 
 ---
 
+## Why I Built This
+
+I've used Redis and distributed systems tooling for years, but I never fully understood what actually happens when:
+
+* A cache node crashes
+* A leader disappears
+* Data must be rerouted
+* Replicas are promoted
+* A new leader is elected
+
+SentinelCache was built to understand these distributed systems concepts by implementing them from scratch rather than treating Redis Cluster as a black box.
+
+The goal wasn't to build another Redis replacement.
+
+The goal was to build a system that could:
+
+1. Distribute keys across nodes
+2. Replicate data
+3. Detect failures
+4. Elect leaders
+5. Recover automatically
+
+and then observe every step happening in real time.
+
+---
+
+## Demo
+
+Start the cluster:
+
+```bash
+docker compose up --build
+```
+
+Kill the leader:
+
+```bash
+docker compose stop node-a
+```
+
+Watch the cluster recover automatically:
+
+```text
+[node-c] leader appears dead — triggering election
+[node-c] starting bully election (term=1, dead=node-a)
+[node-c] no higher peers — winning election immediately
+[node-c] *** WON ELECTION (term=1) — new leader ***
+[node-c] removed dead leader node-a from ring
+[node-c] *** LEADER — failure detector started ***
+```
+
+Verify the new leader:
+
+```bash
+curl -s localhost:8082/cluster/status | jq '{leader_id,node_id}'
+```
+
+```json
+{
+  "leader_id": "node-c",
+  "node_id": "node-c"
+}
+```
+
+No manual intervention required.
+
+---
+
+## Architecture Overview
+
+```text
+                    Leader (e.g. node-a)
+                         │  failure detection
+     ┌───────────────────┼───────────────────┐
+     │   ♥ heartbeats    │                   │
+     ▼                   ▼                   ▼
+
+   Node A             Node B             Node C
+
+ primary for        primary for        primary for
+ ~1/3 of keys      ~1/3 of keys      ~1/3 of keys
+ replica for        replica for        replica for
+ another ~1/3      another ~1/3      another ~1/3
+
+     └──────────── gRPC Replication ──────────┘
+```
+
+---
+
+## Project Stats
+
+| Metric                 | Value                 |
+| ---------------------- | --------------------- |
+| Language               | Go                    |
+| Cluster Size           | 3 Nodes               |
+| Replication Factor     | 2                     |
+| Virtual Nodes          | 150 per physical node |
+| Client Communication   | REST                  |
+| Internal Communication | gRPC                  |
+| Heartbeat Interval     | 1 second              |
+| Failure Timeout        | 5 seconds             |
+| Leader Election        | Bully Algorithm       |
+| Cache Type             | In-Memory             |
+| Eviction Strategy      | LRU                   |
+| Expiration Strategy    | TTL                   |
+
+---
+
+## Key Engineering Highlights
+
+* Built a distributed cache from scratch in Go
+* Consistent hashing with 150 virtual nodes
+* Transparent request forwarding
+* Synchronous gRPC replication with rollback
+* Bidirectional heartbeat streams
+* Automatic failover
+* Bully-algorithm leader election
+* O(1) LRU cache implementation
+* TTL expiration with active cleanup
+* Fully Dockerized multi-node cluster
+
+---
+
+
 ## Quick Start
 
 **Prerequisites:** Docker, Docker Compose, `curl`. Optional: [`jq`](https://stedolan.github.io/jq/) for pretty JSON output.
@@ -507,6 +631,121 @@ Intentionally excluded:
 - Raft/Paxos (uses bully algorithm — simpler, demonstrable, known tradeoffs)
 
 ---
+
+## Design Tradeoffs
+
+### Why Bully Algorithm instead of Raft?
+
+The Bully algorithm is significantly simpler to implement and easier to demonstrate in a local multi-node environment.
+
+**Pros**
+
+* Simple implementation
+* Easy to visualize
+* Small code surface area
+* Great for learning distributed systems
+
+**Cons**
+
+* Not partition-safe
+* Can lead to split-brain scenarios
+* Not suitable for production-grade consensus
+
+A production-grade system would likely use Raft.
+
+---
+
+### Why gRPC Internally and REST Externally?
+
+REST is used for client-facing APIs because:
+
+* Easy to test with curl
+* Human-readable
+* Familiar interface
+* Great developer experience
+
+gRPC is used for node-to-node communication because:
+
+* Strong contracts via protobuf
+* Streaming support
+* Lower serialization overhead
+* Better fit for heartbeats and replication
+
+---
+
+### Why Consistent Hashing?
+
+Traditional modulo hashing causes almost all keys to move when nodes are added or removed.
+
+Example:
+
+```text
+hash(key) % 3
+```
+
+Adding a fourth node changes ownership for nearly every key.
+
+Consistent hashing limits movement to roughly:
+
+```text
+1 / N
+```
+
+of keys, making scaling and failover practical.
+
+---
+
+### Why Synchronous Replication?
+
+SentinelCache uses synchronous replication:
+
+```text
+Client
+  ↓
+Primary Write
+  ↓
+Replica Write
+  ↓
+ACK
+```
+
+The write is only acknowledged after both primary and replica confirm success.
+
+**Pros**
+
+* Stronger consistency
+* Simpler recovery
+* No replica lag
+
+**Cons**
+
+* Higher write latency
+* Reduced availability during replica failures
+
+---
+
+### Why a Single Replica?
+
+Each key is stored on:
+
+```text
+1 Primary
+1 Replica
+```
+
+This keeps the implementation focused on distributed systems fundamentals without introducing quorum logic.
+
+A production system would likely support:
+
+```text
+1 Primary
+N Replicas
+```
+
+with configurable replication factors.
+
+---
+
 
 ## Future Enhancements
 
